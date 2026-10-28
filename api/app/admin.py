@@ -7,17 +7,19 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ask import get_db, rate_limit
+from app.ask import admin_rate_limit, get_db
 from app.config import settings
 from app.models import Question
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(rate_limit)])
+router = APIRouter(prefix="/admin", dependencies=[Depends(admin_rate_limit)])
 
 
 def require_admin(x_admin_key: str | None = Header(default=None)) -> None:
     if not settings.admin_key:
         raise HTTPException(status_code=503, detail="Admin is niet geconfigureerd.")
-    if x_admin_key is None or not hmac.compare_digest(x_admin_key, settings.admin_key):
+    if x_admin_key is None or not hmac.compare_digest(
+        x_admin_key.encode("utf-8"), settings.admin_key.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Ongeldige admin-sleutel.")
 
 
