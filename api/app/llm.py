@@ -1,6 +1,8 @@
 import asyncio
 import re
+import tempfile
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Protocol
 
 import httpx
@@ -8,6 +10,19 @@ import httpx
 from app.config import settings
 
 NOT_FOUND = "NIET_GEVONDEN"
+# The CLI is used as a plain text model: no file, shell or web tools, and an empty working folder.
+CLAUDE_CLI_BLOCKED_TOOLS = (
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+)
 
 SYSTEM_PROMPT = (
     "Je beantwoordt vragen van medewerkers uitsluitend op basis van de aangeleverde passages. "
@@ -21,7 +36,7 @@ SYSTEM_PROMPT = (
 def is_not_found(text: str) -> bool:
     """True for the NOT_FOUND marker, tolerating the case and spelling slips small models make."""
     letters = re.sub(r"[^a-z]", "", text.lower())
-    return letters.startswith("nietgevonden") or ("gevonden" in letters and len(text) < 40)
+    return len(letters) <= 20 and SequenceMatcher(None, letters, "nietgevonden").ratio() >= 0.8
 
 
 @dataclass
@@ -87,18 +102,24 @@ class ClaudeCliBackend:
 
     async def generate(self, question: str, passages: list[Passage]) -> str | None:
         prompt = f"{SYSTEM_PROMPT}\n\n{build_prompt(question, passages)}"
-        process = await asyncio.create_subprocess_exec(
-            "claude",
-            "-p",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(prompt.encode()), timeout=120)
-        except TimeoutError:
-            process.kill()
-            raise
+        with tempfile.TemporaryDirectory() as workdir:
+            process = await asyncio.create_subprocess_exec(
+                "claude",
+                "-p",
+                "--disallowedTools",
+                *CLAUDE_CLI_BLOCKED_TOOLS,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workdir,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    process.communicate(prompt.encode()), timeout=120
+                )
+            except TimeoutError:
+                process.kill()
+                raise
         if process.returncode != 0:
             raise RuntimeError("claude CLI failed")
         return stdout.decode().strip()
