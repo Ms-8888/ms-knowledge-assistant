@@ -1,5 +1,7 @@
 # ms-knowledge-assistant
 
+[![CI](https://github.com/Ms-8888/ms-knowledge-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/Ms-8888/ms-knowledge-assistant/actions/workflows/ci.yml)
+
 A Dutch-language question-answering demo over company documents: ask a question, get an answer with the passages it came from, or an honest "ik weet het niet" when the documents don't say.
 
 Built with FastAPI, PostgreSQL + pgvector, local multilingual embeddings and a small React UI. The documents in this demo are fictional (a made-up company, "Brouwer & Zonen NV").
