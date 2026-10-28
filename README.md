@@ -29,16 +29,16 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Then open <http://localhost:8080>. The first start downloads images and builds the embedding model into the API image; on a warm Docker cache it was healthy in about 25 seconds, and about a minute from a colder cache (measured on one machine, see below). The seed documents are ingested automatically.
+Then open <http://localhost:8080>. The first start downloads images and builds the embedding model into the API image; on the author's laptop it was healthy in about 25 seconds with a warm Docker cache and about a minute from a colder one (timed once, not benchmarked). The seed documents are ingested automatically.
 
-The **Beheer** tab needs the `ADMIN_KEY` from your `.env` (change it from the example value; leave it empty to disable the tab). The API and the UI listen on `127.0.0.1` only.
+The **Beheer** tab needs an `ADMIN_KEY` that you set in `.env` (it is empty by default, which switches the tab off). The API and the UI listen on `127.0.0.1` only.
 
 ## Answer modes
 
 | `LLM_BACKEND` | Needs | What you get |
 |---|---|---|
 | `extractive` (default) | nothing | The most relevant passage and its sources. No generated text. |
-| `ollama` | [Ollama](https://ollama.com) running on the host with a model pulled (tested: `qwen2.5:7b`) | A short Dutch answer written by a local model. No key, and nothing leaves the machine. Needs a few GB of disk and RAM; tested on a 6 GB laptop GPU. |
+| `ollama` | [Ollama](https://ollama.com) running on the host with a model pulled (tested: `qwen2.5:7b`) | A short Dutch answer written by a local model. No key, and nothing leaves the machine. Needs a few GB of disk and RAM; the author ran it on a laptop with an RTX 3060 (6 GB). |
 | `anthropic` | `ANTHROPIC_API_KEY` | A short Dutch answer written by Claude from the retrieved passages, with a daily call cap and a kill switch (`LLM_ENABLED=false`). **Not yet run end to end.** |
 | `claude-cli` | the `claude` CLI, logged in, on the same machine | The same as above through the author's own Claude Code login. Development mode for the author, not a deployable backend, and it does not work inside the Docker image. |
 
@@ -48,7 +48,7 @@ Embeddings always run locally (`paraphrase-multilingual-MiniLM-L12-v2`, 384 dime
 
 ## Evaluation
 
-38 hand-written questions over the 5 seed documents, checked automatically by `eval/run_eval.py` (expected source, and a fact that must appear in the answer). The retrieval threshold (0.28) was chosen from a separate 10-question test before these questions were written and was not tuned on them. Raw results are in `eval/results/`.
+38 hand-written questions over the 5 seed documents, checked automatically by `eval/run_eval.py` (expected source, and a fact that must appear in the answer). The retrieval threshold (0.28) was chosen from a separate 10-question test (`eval/threshold_spike.py`) before these questions were written and was not tuned on them. Raw results are in `eval/results/`.
 
 | Measure | `extractive` (no model) | `ollama` `qwen2.5:7b` (local) | `claude-cli` (Claude, author's login) |
 |---|---|---|---|
@@ -59,11 +59,11 @@ Embeddings always run locally (`paraphrase-multilingual-MiniLM-L12-v2`, 384 dime
 | Prompt injection (2): clean refusal | 0/2 | 1/2 | 1/2 |
 | Mean time per question | 2 s | 3 s | 10 s |
 
-Retrieval is the same in every mode (same embeddings and database): the right document is ranked first for 27 of 28 questions and is in the top 4 for all 28. In the `ollama` run the model refused one answerable question, so that question returned no citations.
+Retrieval is identical in every mode (same embeddings and database): the right document is ranked first for 27 of 28 questions and is in the top 4 for all 28. A refused question returns no citations, so the `ollama` result file shows 26 and 27 for those two figures: the difference is the one answerable question the local model wrongly refused.
 
 What these numbers say and don't say:
 
-- **Without a model, "ik weet het niet" only works for off-topic questions.** A question about the right area but not in the documents scores 0.33–0.54, higher than some genuine questions (0.37), so no similarity threshold can separate them. Both models did it 4/4.
+- **Without a model, "ik weet het niet" only works for off-topic questions.** A question about the right area but not in the documents scores 0.33–0.54. Three of the four score 0.48–0.54, above the lowest-scoring real questions (0.42 and 0.42), so no similarity threshold can separate them. Both models did it 4/4.
 - **The local model is close to the cloud one, with two weaknesses.** It wrongly refused one answerable question ("krijg ik mijn benzine terug als ik privé rij…": the answer is no, it said it didn't know). On the instruction-injection test it replied with the single word "Systeemprompt": nothing leaked, but it isn't a clean refusal.
 - **The one retrieval miss** ("welk nummer bel ik in levensgevaar?") went to the handbook first because the PDF has no headings, so its single passage mixes three topics. The right document was still in the top 4.
 - **The first local run looked perfect and was wrong.** Reading the answers showed the model had written `Niet_gevonden` and `NIEGT_GEVONDEN` instead of the exact refusal marker. The backend only accepted the exact string, so garbled refusals reached users as answers, and my fact check let one through because it searched for "niet". I fixed the backend (it now accepts case and spelling slips, with tests) and tightened the check, then re-scored the stored runs and re-ran the local model. The original run is kept as `eval/results/ollama-qwen2.5-7b-run1-before-fix.json`; scored with the stricter check it is 27/28 facts and 1/2 injection-safe, not the 28/28 and 2/2 it first showed.
@@ -74,17 +74,22 @@ What these numbers say and don't say:
 ## Security notes
 
 - No file-upload endpoint. Documents are ingested from a folder at startup or with `python -m app.ingest`.
-- Questions are length-limited (3–500 characters) and rate-limited per client (in memory, single process).
+- Questions are length-limited (3–500 characters) and rate-limited per client address (30 per minute, in memory, single process; admin requests have their own limit). nginx passes the visitor's address to the API so one noisy client cannot lock out the others.
 - The admin endpoints require an `X-Admin-Key` compared in constant time, and are off when no key is set.
 - The model prompt treats passages as data and tells the model to ignore instructions inside them.
 - SQL goes through SQLAlchemy with bound parameters. The UI renders text only (no HTML injection).
-- Dependencies are pinned. `pip-audit` and `npm audit` were clean when this was written, and gitleaks runs in CI.
+- Dependencies are pinned. The author ran `pip-audit` and `npm audit` (no known vulnerabilities) before publishing; CI itself runs lint, tests, the web build and gitleaks, not the audits.
+- A failing or unavailable model never produces an error page: the visitor gets the best passage instead. The `claude-cli` backend runs with file, shell and web tools switched off and an empty working folder.
+- The API container runs as a non-root user. The admin key is empty by default, which switches the admin view off.
 
 ## Limitations
 
 - Passages are cut by headings and length only. PDFs have no heading detection, so multi-topic pages become one blurry passage.
 - The "confidence" shown is the best similarity score. It is not a calibrated probability.
-- Tables are created at startup; there are no migrations. The rate limiter is per process.
+- Tables are created at startup; there are no migrations. The rate limiter is per process and in memory.
+- Documents are read from the seed folder at startup; a file that cannot be read is skipped and reported, and a file removed from the folder is removed from the knowledge base on the next ingest.
+- Asked questions are stored without an expiry and are visible to whoever holds the admin key.
+- There is no TLS: put the stack behind an HTTPS proxy before exposing it beyond localhost, because the admin key is sent in the clear otherwise.
 - One English question in the evaluation was answered correctly, but the corpus is Dutch and answers come back in Dutch.
 - One small synthetic corpus. Nothing here has been tested on real company documents or under load.
 
@@ -110,3 +115,7 @@ python eval/run_eval.py http://localhost:8080/api eval/results/extractive.json
 ## Stack
 
 Python 3.12 · FastAPI · PostgreSQL 16 + pgvector · fastembed (ONNX) · React 19 · TypeScript · Vite · nginx · Docker Compose · GitHub Actions
+
+## Independent review
+
+Before this was shared, four reviewers (security, claims audit, code quality, recruiter view) read it independently. They found real problems, all reproduced with a failing test and then fixed: deleted documents kept being answered from; every visitor shared one rate-limit bucket behind nginx; one unreadable file stopped startup; a model outage became a 500; the daily cap counted questions that never reached a model; a short answer containing the word "gevonden" was treated as a refusal; and a very long unpunctuated line produced an oversized chunk. The tests for each are in `api/tests/test_regressions.py`.

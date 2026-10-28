@@ -1,5 +1,8 @@
+import asyncio
+import logging
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -13,6 +16,7 @@ from app.llm import LLMBackend, Passage, get_backend, is_not_found
 from app.models import Chunk, Document, Question
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 NO_ANSWER = "Ik weet het niet: dit staat niet in de beschikbare documenten."
 
@@ -24,15 +28,27 @@ async def get_db():
         yield session
 
 
-def rate_limit(request: Request) -> None:
-    client = request.client.host if request.client else "unknown"
-    now = time.monotonic()
-    window = _hits[client]
-    while window and now - window[0] > 60:
-        window.popleft()
-    if len(window) >= settings.ask_rate_limit_per_minute:
-        raise HTTPException(status_code=429, detail="Te veel vragen, probeer het zo opnieuw.")
-    window.append(now)
+def make_rate_limit(scope: str) -> Callable[[Request], None]:
+    """Per-client sliding window; `ask` and `admin` get separate buckets."""
+
+    def limit(request: Request) -> None:
+        client = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        if len(_hits) > 500:  # drop clients that have been quiet for a minute
+            for key in [k for k, w in _hits.items() if not w or now - w[-1] > 60]:
+                del _hits[key]
+        window = _hits[f"{scope}:{client}"]
+        while window and now - window[0] > 60:
+            window.popleft()
+        if len(window) >= settings.ask_rate_limit_per_minute:
+            raise HTTPException(status_code=429, detail="Te veel vragen, probeer het zo opnieuw.")
+        window.append(now)
+
+    return limit
+
+
+rate_limit = make_rate_limit("ask")
+admin_rate_limit = make_rate_limit("admin")
 
 
 class AskRequest(BaseModel):
@@ -56,7 +72,7 @@ class AskResponse(BaseModel):
 
 
 async def retrieve(db: AsyncSession, question: str) -> list[Passage]:
-    vector = embed([question])[0]
+    vector = (await asyncio.to_thread(embed, [question]))[0]
     distance = Chunk.embedding.cosine_distance(vector)
     rows = await db.execute(
         select(Chunk, Document.source, (1 - distance).label("score"))
@@ -95,6 +111,7 @@ async def ask(
     answered = bool(passages) and top >= settings.min_score
     answer = NO_ANSWER
     backend_used = llm.name
+    llm_called = False
 
     if answered:
         if llm.name != "extractive":
@@ -102,7 +119,12 @@ async def ask(
                 raise HTTPException(status_code=503, detail="Antwoorden genereren staat uit.")
             if await calls_today(db, llm.name) >= settings.llm_daily_call_cap:
                 raise HTTPException(status_code=429, detail="Dagelijkse limiet bereikt.")
-        generated = await llm.generate(body.question, passages)
+        llm_called = llm.name != "extractive"
+        try:
+            generated = await llm.generate(body.question, passages)
+        except Exception:  # a model outage must not turn into a 500 for the visitor
+            logger.exception("Answer generation failed; falling back to the best passage")
+            generated, backend_used = None, "extractive"
         if generated is None:
             answer = passages[0].text
         elif is_not_found(generated):
@@ -118,7 +140,7 @@ async def ask(
             question=body.question,
             answered=answered,
             confidence=round(top, 3),
-            backend=backend_used,
+            backend=llm.name if llm_called else "none",
         )
     )
     await db.commit()

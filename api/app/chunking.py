@@ -86,8 +86,33 @@ def parse(path: Path) -> list[Section]:
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
+def _hard_wrap(text: str) -> list[str]:
+    """Split a piece that is still too long at spaces; cut inside a word only as a last resort."""
+    pieces: list[str] = []
+    current = ""
+    for word in text.split(" "):
+        while len(word) > MAX_CHARS:
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(word[:MAX_CHARS])
+            word = word[MAX_CHARS:]
+        if current and len(current) + len(word) + 1 > MAX_CHARS:
+            pieces.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        pieces.append(current)
+    return pieces
+
+
 def _split_long(paragraph: str) -> list[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+    sentences = [
+        part
+        for sentence in re.split(r"(?<=[.!?])\s+", paragraph)
+        for part in (_hard_wrap(sentence) if len(sentence) > MAX_CHARS else [sentence])
+    ]
     parts: list[str] = []
     current = ""
     for sentence in sentences:
